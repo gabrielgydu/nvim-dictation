@@ -3,7 +3,7 @@ local M = {}
 M.config = nil
 
 local defaults = {
-  provider = 'assemblyai', -- 'assemblyai' | 'deepgram' | 'fake'
+  provider = 'assemblyai', -- 'assemblyai' | 'deepgram' | 'stt' | 'fake'
   -- when to start the sidecar process: 'eager' (on setup), 'insert' (first
   -- InsertEnter), 'lazy' (first dictation activation; first recording may
   -- lose ~100ms of audio to deno cold start)
@@ -36,6 +36,14 @@ local defaults = {
     keyterms = {},
     api_key_env = 'DEEPGRAM_API_KEY',
     api_key_cmd = nil,
+  },
+  stt = {
+    -- argv of a command that reads raw PCM on stdin and prints `stt stream`
+    -- JSON lines; it owns the provider, the key, languages and key terms
+    cmd = { 'stt', 'stream' },
+    languages = nil, -- language hints, e.g. { 'en', 'de' }; nil = its config, {} = none
+    terms = nil, -- key terms, e.g. { 'Neovim' }; nil = its config, {} = none
+    terms_file = nil, -- key terms, one per line (for terms with commas); instead of terms
   },
   finalize_timeout_ms = 6000,
   exclude = {

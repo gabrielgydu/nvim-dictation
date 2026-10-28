@@ -11,7 +11,22 @@ end
 if vim.env.DICT_TEST_MIC then
   opts.audio = { mic_cmd = { 'sh', '-c', vim.env.DICT_TEST_MIC } }
 end
+if vim.env.DICT_TEST_STT then
+  local function list(v)
+    return v and vim.split(v, ',', { trimempty = true })
+  end
+  opts.stt = {
+    cmd = { vim.env.DICT_TEST_STT, 'stream' },
+    languages = list(vim.env.DICT_TEST_STT_LANGUAGES),
+    terms = list(vim.env.DICT_TEST_STT_TERMS),
+  }
+end
 require('dictation').setup(opts)
+
+-- Dump the message history (vim.notify lands there) to a file
+vim.api.nvim_create_user_command('DMessages', function(o)
+  vim.fn.writefile(vim.split(vim.fn.execute('messages'), '\n'), o.args)
+end, { nargs = 1 })
 
 -- Dump ground truth to a file: line 1, session state, register d, extmark count
 vim.api.nvim_create_user_command('DDump', function(o)

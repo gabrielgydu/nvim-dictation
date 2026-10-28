@@ -122,6 +122,13 @@ function M.activate(strip)
       token_endpoint = cfg.assemblyai.token_endpoint,
       keyterms = cfg.assemblyai.keyterms,
     }
+  elseif cfg.provider == 'stt' then
+    options.stt = {
+      cmd = cfg.stt.cmd,
+      languages = cfg.stt.languages,
+      terms = cfg.stt.terms,
+      termsFile = cfg.stt.terms_file,
+    }
   end
   sidecar.send({ cmd = 'start', session = sid, provider = cfg.provider, options = options })
   require('dictation.ui').show_recording(buf, row)

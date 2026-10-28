@@ -24,8 +24,16 @@ echo "== e2e tmux (fake provider) =="
 echo "== e2e deepgram mock =="
 "$ROOT/test/e2e_deepgram_mock.sh" || FAIL=1
 
-echo "== e2e assemblyai live (skips without key) =="
-"$ROOT/test/e2e_assemblyai_live.sh" || FAIL=1
+echo "== e2e stt (fake provider; skips without stt) =="
+"$ROOT/test/e2e_stt.sh" || FAIL=1
+
+# the live test spends streaming credit: only on request
+if [ "${DICT_LIVE:-}" = 1 ]; then
+  echo "== e2e assemblyai live (skips without key) =="
+  "$ROOT/test/e2e_assemblyai_live.sh" || FAIL=1
+else
+  echo "== e2e assemblyai live: skipped (costs credit; DICT_LIVE=1 runs it) =="
+fi
 
 [ $FAIL -eq 0 ] && echo "SUITE PASS" || echo "SUITE FAIL"
 exit $FAIL

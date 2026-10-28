@@ -24,6 +24,12 @@ interface StartOptions {
     token_endpoint?: string;
     keyterms?: string[];
   };
+  stt?: {
+    cmd?: string[];
+    languages?: string[] | string;
+    terms?: string[] | string;
+    termsFile?: string;
+  };
 }
 
 function emit(ev: Json) {
@@ -32,6 +38,21 @@ function emit(ev: Json) {
 
 function asArray(v: unknown): string[] {
   return Array.isArray(v) ? v : [];
+}
+
+/** Lines of a byte stream, trimmed, blank ones skipped. */
+async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const dec = new TextDecoder();
+  let buf = "";
+  for await (const chunk of stream) {
+    buf += dec.decode(chunk, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) yield line;
+    }
+  }
 }
 
 abstract class Session {
@@ -86,8 +107,6 @@ const MAX_REPLAY_BYTES = 8_000_000; // ~250s of 16kHz mono s16le
 
 abstract class StreamingSession extends Session {
   protected opts!: StartOptions;
-  protected ws?: WebSocket;
-  protected wsOpen = false;
   protected stopRequested = false;
   protected cancelled = false;
   protected finished = false;
@@ -96,13 +115,20 @@ abstract class StreamingSession extends Session {
   protected replay: Uint8Array[] = []; // full session audio, kept for one retry
   private replayBytes = 0;
   private mic?: Deno.ChildProcess;
+  private micKilled = false;
   private stderrTail = "";
   private lastLevelAt = 0;
   private stopTimeout: ReturnType<typeof setTimeout> | undefined;
 
   /** Look up the API key + open the first connection. Emit + finish on failure. */
   protected abstract init(): void;
-  /** Deliver one audio chunk to an open socket. */
+  /** True while audio can go out (sendAudio / requestStop may be called). */
+  protected abstract isOpen(): boolean;
+  /** Not open yet, not closed either: the transport's own handlers carry on. */
+  protected abstract isConnecting(): boolean;
+  /** Close the provider transport; finish() calls it, also on cancel. */
+  protected abstract closeTransport(): void;
+  /** Deliver one audio chunk to an open transport. */
   protected abstract sendAudio(chunk: Uint8Array): void;
   /** Ask the provider to flush and finish (mic is already dead). */
   protected abstract requestStop(): void;
@@ -137,7 +163,7 @@ abstract class StreamingSession extends Session {
   }
 
   protected sendOrQueue(chunk: Uint8Array) {
-    if (this.wsOpen) this.sendAudio(chunk);
+    if (this.isOpen()) this.sendAudio(chunk);
     else this.pending.push(chunk);
   }
 
@@ -179,7 +205,7 @@ abstract class StreamingSession extends Session {
     } catch {
       /* stream broke — handled below */
     }
-    if (!this.stopRequested && !this.cancelled && !this.finished) {
+    if (!this.stopRequested && !this.cancelled && !this.finished && !this.micKilled) {
       emit({
         event: "error",
         session: this.id,
@@ -219,6 +245,7 @@ abstract class StreamingSession extends Session {
   }
 
   protected killMic() {
+    this.micKilled = true;
     try {
       this.mic?.kill("SIGTERM");
     } catch {
@@ -230,18 +257,18 @@ abstract class StreamingSession extends Session {
     if (this.stopRequested || this.finished || this.cancelled) return;
     this.stopRequested = true;
     this.killMic();
-    if (this.wsOpen) {
+    if (this.isOpen()) {
       try {
         this.requestStop();
       } catch {
         this.finish();
         return;
       }
-    } else if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+    } else if (!this.isConnecting()) {
       this.finish();
       return;
     }
-    // if the socket is still connecting, onopen flushes audio + requestStop
+    // if the transport is still connecting, it flushes audio + requestStop once open
     this.stopTimeout = setTimeout(() => this.finish(), 5000);
   }
 
@@ -255,7 +282,7 @@ abstract class StreamingSession extends Session {
     }
     emit({ event: "end", session: this.id });
     try {
-      this.ws?.close();
+      this.closeTransport();
     } catch {
       /* ignore */
     }
@@ -267,9 +294,28 @@ abstract class StreamingSession extends Session {
   }
 }
 
+// ------------------------------------------------- websocket base class
+
+abstract class WebSocketSession extends StreamingSession {
+  protected ws?: WebSocket;
+  protected wsOpen = false;
+
+  protected isOpen(): boolean {
+    return this.wsOpen;
+  }
+
+  protected isConnecting(): boolean {
+    return !!this.ws && this.ws.readyState !== WebSocket.CLOSED;
+  }
+
+  protected closeTransport() {
+    this.ws?.close();
+  }
+}
+
 // ------------------------------------------------------------ deepgram
 
-class DeepgramSession extends StreamingSession {
+class DeepgramSession extends WebSocketSession {
   private key = "";
   private finals: string[] = [];
   private lastInterim = "";
@@ -378,7 +424,7 @@ class DeepgramSession extends StreamingSession {
 const AAI_MIN_CHUNK = 1600; // 50ms of 16kHz s16le
 const AAI_MAX_CHUNK = 25600; // 800ms
 
-class AssemblyAISession extends StreamingSession {
+class AssemblyAISession extends WebSocketSession {
   private key = "";
   private turns = new Map<number, string>();
   private sendBuf: Uint8Array[] = [];
@@ -521,7 +567,191 @@ class AssemblyAISession extends StreamingSession {
   }
 }
 
+// ------------------------------------------------------------------ stt
+
+// One line of `stt stream` output (only the fields used here).
+interface SttEvent {
+  type?: string;
+  text?: string;
+  message?: string;
+}
+
+/** A list as one comma-separated argument; a string passes as is. */
+function csv(v: string[] | string | undefined): string | undefined {
+  return Array.isArray(v) ? v.join(",") : v;
+}
+
+// Runs `stt stream` (or any command speaking its protocol) once per
+// dictation: raw PCM on the child's stdin, one JSON event per line on its
+// stdout. stt owns the provider, key, language hints and key terms. It reads
+// stdin from the start and buffers while it connects, so the transport is
+// open as soon as the child runs. stt never reconnects: after a failure
+// nothing more is heard, and the words heard before it are kept.
+class SttSession extends StreamingSession {
+  private proc?: Deno.ChildProcess;
+  private stdin?: WritableStreamDefaultWriter<Uint8Array>;
+  private exited = false;
+  private finals: string[] = [];
+  private partial = "";
+  private errorMessage = ""; // from stt's error line
+  private lastStderr = ""; // stt's last stderr line is `stt: <message>`
+
+  protected init() {
+    const stt = this.opts.stt ?? {};
+    const cmd = stt.cmd ?? ["stt", "stream"];
+    if (!Array.isArray(cmd) || !cmd.length) {
+      this.fatal("stt.cmd must be an argv list, e.g. { 'stt', 'stream' }");
+      return;
+    }
+    // one argument each: a value starting with "-" would read as an option
+    const args = cmd.slice(1);
+    const languages = csv(stt.languages);
+    if (languages !== undefined) args.push(`--languages=${languages}`);
+    const terms = csv(stt.terms);
+    if (terms !== undefined) args.push(`--terms=${terms}`);
+    if (stt.termsFile) args.push(`--terms-file=${stt.termsFile}`);
+    let proc: Deno.ChildProcess;
+    try {
+      proc = new Deno.Command(cmd[0], {
+        args,
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+    } catch (e) {
+      this.fatal(
+        e instanceof Deno.errors.NotFound
+          ? `${cmd[0]} not found (put it on PATH or set stt.cmd to its full path)`
+          : `stt spawn failed (${cmd[0]}): ${e}`,
+      );
+      return;
+    }
+    this.proc = proc;
+    this.stdin = proc.stdin.getWriter();
+    this.watch(proc);
+  }
+
+  // Reads the child to the end, then settles the session by how it ended.
+  private async watch(proc: Deno.ChildProcess) {
+    const [status] = await Promise.all([proc.status, this.readEvents(proc.stdout), this.readStderr(proc.stderr)]);
+    this.exited = true;
+    this.dropStdin(); // nothing reads it any more
+    if (this.finished) return; // cancelled, or the stop timeout already committed
+    if (status.success && this.stopRequested) {
+      this.finish();
+      return;
+    }
+    const reason = this.errorMessage || this.lastStderr.replace(/^stt: /, "") ||
+      (status.success ? "ended before the dictation did" : `exited with status ${status.code}`);
+    const message = `stt: ${reason}`;
+    if (!this.finalText()) {
+      this.fatal(message);
+    } else if (this.stopRequested) {
+      // keep the words heard so far, and say why they may be incomplete
+      emit({ event: "error", session: this.id, fatal: false, message });
+      this.finish();
+    } else {
+      // Space is still held: nothing more can be heard, but the words so far
+      // stay on screen, and the release commits them (stop() finds no
+      // transport and finishes at once)
+      emit({
+        event: "error",
+        session: this.id,
+        fatal: false,
+        message: `${message}; release Space to insert the words heard so far`,
+      });
+      this.killMic();
+    }
+  }
+
+  private async readEvents(stdout: ReadableStream<Uint8Array>) {
+    try {
+      for await (const line of lines(stdout)) this.onEvent(line);
+    } catch {
+      /* the child is gone */
+    }
+  }
+
+  private async readStderr(stderr: ReadableStream<Uint8Array>) {
+    try {
+      for await (const line of lines(stderr)) {
+        this.lastStderr = line;
+        console.error(line); // shown with debug = true
+      }
+    } catch {
+      /* the child is gone */
+    }
+  }
+
+  private onEvent(line: string) {
+    let ev: SttEvent | null;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return; // not a protocol line
+    }
+    switch (ev?.type) {
+      case "partial": // the open turn's whole text so far
+        this.partial = ev.text ?? "";
+        break;
+      case "final": // closes the open turn
+        if (ev.text) this.finals.push(ev.text);
+        this.partial = "";
+        break;
+      case "error": // the exit status follows; watch() reports it
+        this.errorMessage = ev.message ?? "";
+        return;
+      case "note":
+        console.error(`stt note: ${ev.message}`);
+        return;
+      default: // ready, end
+        return;
+    }
+    emit({ event: "interim", session: this.id, text: this.finalText() });
+  }
+
+  protected isOpen(): boolean {
+    return !!this.stdin && !this.exited;
+  }
+
+  protected isConnecting(): boolean {
+    return false; // stt buffers while it connects: open from the start
+  }
+
+  protected sendAudio(chunk: Uint8Array) {
+    // not awaited: writes queue in order; a dead child rejects them
+    this.stdin!.write(chunk).catch(() => {});
+  }
+
+  protected requestStop() {
+    // EOF: stt finalizes, prints the last finals and `end`, exits 0
+    this.stdin!.close().catch(() => {});
+  }
+
+  protected closeTransport() {
+    // cancel, or a stop that timed out: stt cuts the provider session at once
+    if (!this.exited) this.proc?.kill("SIGTERM");
+    this.dropStdin();
+  }
+
+  /** Closes our end of the child's stdin pipe; a no-op once it is closed. */
+  private dropStdin() {
+    this.stdin?.abort().catch(() => {});
+  }
+
+  protected finalText(): string {
+    return [...this.finals, this.partial].filter(Boolean).join(" ");
+  }
+}
+
 // ---------------------------------------------------------------- main
+
+const PROVIDERS = new Map<string, new (id: number) => Session>([
+  ["fake", FakeSession],
+  ["deepgram", DeepgramSession],
+  ["assemblyai", AssemblyAISession],
+  ["stt", SttSession],
+]);
 
 let current: Session | null = null;
 
@@ -529,12 +759,14 @@ function handle(cmd: any) {
   switch (cmd.cmd) {
     case "start": {
       current?.cancel();
-      const provider = cmd.provider;
-      current = provider === "fake"
-        ? new FakeSession(cmd.session)
-        : provider === "assemblyai"
-        ? new AssemblyAISession(cmd.session)
-        : new DeepgramSession(cmd.session);
+      current = null;
+      const Provider = PROVIDERS.get(cmd.provider);
+      if (!Provider) {
+        emit({ event: "error", session: cmd.session, fatal: true, message: `unknown provider: ${cmd.provider}` });
+        emit({ event: "end", session: cmd.session });
+        break;
+      }
+      current = new Provider(cmd.session);
       current.start((cmd.options ?? {}) as StartOptions);
       break;
     }
@@ -552,23 +784,14 @@ function handle(cmd: any) {
 
 emit({ event: "ready" });
 
-const dec = new TextDecoder();
-let buf = "";
-for await (const chunk of Deno.stdin.readable) {
-  buf += dec.decode(chunk, { stream: true });
-  let nl;
-  while ((nl = buf.indexOf("\n")) >= 0) {
-    const line = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!line) continue;
-    let cmd: unknown;
-    try {
-      cmd = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    handle(cmd);
+for await (const line of lines(Deno.stdin.readable)) {
+  let cmd: unknown;
+  try {
+    cmd = JSON.parse(line);
+  } catch {
+    continue;
   }
+  handle(cmd);
 }
 
 // stdin closed: Neovim exited
